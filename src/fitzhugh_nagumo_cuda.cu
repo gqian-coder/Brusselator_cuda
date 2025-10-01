@@ -55,14 +55,15 @@ int main(int argc, char** argv){
   size_t Ny = (size_t)std::ceil((double)Ly / dh) ;
 
   const double inv_h2 = 1.0/(dh*dh);   // adjust if anisotropic
-  //const double A=5, B=10, Du=1.0, Dv=9.0;
-  //const double A=2.5, B=10, Du=1.0, Dv=9.0;
-  //const double A=2.5, B=10, Du=0.5, Dv=4.5;
-  const double A=2.5, B=10, Du=0.4, Dv=3.5;
+  
+  // FitzHugh-Nagumo parameters
+  const double Du = 1.0;      // Diffusion coefficient for u (voltage-like variable)
+  const double Dv = 1.0;      // Diffusion coefficient for v (recovery variable)
+  const double a = 0.1;       // Threshold parameter
+  const double gamma = 1.0;   // Recovery parameter
+  const double epsilon = 0.01; // Time scale separation (small value)
 
-  // Set Dv to generate Turing instability
-  double D_thresh = A*A / (std::sqrt(B)-1) / (std::sqrt(B)-1) * Du;
-  // Check for CFL
+  // Check for CFL condition
   double dt_cfl = std::min(dh*dh/4.0/ Du, dh*dh/4.0/Dv);
   if (rank==0) std::cout << "CFL required dt " << dt_cfl << "\n";
   if (dt >= dt_cfl) {
@@ -70,7 +71,12 @@ int main(int argc, char** argv){
       MPI_Finalize();
       return -1;
   }
-  if (Dv > D_thresh) std::cout << "Turing instability occurred: Dv = " << Dv << "\n";
+  
+  if (rank==0) {
+    std::cout << "FitzHugh-Nagumo parameters:\n";
+    std::cout << "Du = " << Du << ", Dv = " << Dv << "\n";
+    std::cout << "a = " << a << ", gamma = " << gamma << ", epsilon = " << epsilon << "\n";
+  }
 
   // --- select GPU ---
   int ngpu=0; ck(cudaGetDeviceCount(&ngpu));
@@ -93,13 +99,14 @@ int main(int argc, char** argv){
 
   // Initialize ADIOS2
   adios2::ADIOS adios(MPI_COMM_WORLD);
-  adios2::IO io = adios.DeclareIO("Brusselator");
+  adios2::IO io = adios.DeclareIO("FitzHugh-Nagumo");
   std::vector<std::size_t> shape = {(std::size_t)Nx, (std::size_t)Ny};
   std::vector<std::size_t> start = {(std::size_t)(0), (std::size_t)(0)};
   std::vector<std::size_t> count = {(std::size_t)Nx, (std::size_t)Ny};
 
   // --- host init + H2D ---
-  std::vector<double> u_h(nTot, A), v_h(nTot, B/A);
+  // Initialize with typical FitzHugh-Nagumo resting state
+  std::vector<double> u_h(nTot, 0.0), v_h(nTot, 0.0); // Resting state
   if (init_fun<2) {
       // Get the original data size
       size_t zm_Nx = (std::size_t)(static_cast<double>(Nx) / zm_factor);
@@ -170,12 +177,9 @@ int main(int argc, char** argv){
   if (compression_cpt) {
     compressed_u = (void *)malloc(bytes);
     compressed_v = (void *)malloc(bytes);
-    //ck(cudaMalloc(&compressed_u,  bytes));
-    //ck(cudaMalloc(&compressed_v,  bytes));
     config.lossless = mgard_x::lossless_type::Huffman_Zstd;
     config.normalize_coordinates = true;
     config.dev_type = mgard_x::device_type::SERIAL;
-    //config.dev_id   = 1;
   }
 
   std::cout << "start loop\n";
@@ -215,22 +219,24 @@ int main(int argc, char** argv){
       writer.PerformPuts();
       writer.EndStep();
     }
-    // 1) Exchange halos here (device-to-device if CUDA-aware; else stage)
+    
+    // RK4 time integration using FitzHugh-Nagumo equations
+    
     // ===== k1 ===== 
     laplacian2d<<<gs,bs>>>(u_d, Lu_d, g, inv_h2);
     laplacian2d<<<gs,bs>>>(v_d, Lv_d, g, inv_h2);
-    brusselator_rhs<<<gs,bs>>>(u_d, v_d, Lu_d, Lv_d, k1u, k1v, g, Du, Dv, A, B);
+    fitzhugh_nagumo_rhs<<<gs,bs>>>(u_d, v_d, Lu_d, Lv_d, k1u, k1v, g, Du, Dv, a, gamma, epsilon);
 
     // ===== k2 ===== 
-    // ut = u + (dt/2) * k2
-    // vt = v + (dt/2) * k2
+    // ut = u + (dt/2) * k1
+    // vt = v + (dt/2) * k1
     axpy2d_full<<<gs, bs>>>(u_d, v_d, k1u, k1v, 0.5*dt, ut, vt, Nx, Ny);
 
     // Laplacians at tmp
     laplacian2d<<<gs,bs>>>(ut, Lu_d, g, inv_h2);
     laplacian2d<<<gs,bs>>>(vt, Lv_d, g, inv_h2);
     // k2 = f(ut, vt)
-    brusselator_rhs<<<gs,bs>>>(ut, vt, Lu_d, Lv_d, k2u, k2v, g, Du, Dv, A, B);
+    fitzhugh_nagumo_rhs<<<gs,bs>>>(ut, vt, Lu_d, Lv_d, k2u, k2v, g, Du, Dv, a, gamma, epsilon);
 
     // ===== k3 =====
     // ut = u + (dt/2) * k2
@@ -240,7 +246,7 @@ int main(int argc, char** argv){
     laplacian2d<<<gs,bs>>>(ut, Lu_d, g, inv_h2);
     laplacian2d<<<gs,bs>>>(vt, Lv_d, g, inv_h2);
 
-    brusselator_rhs<<<gs,bs>>>(ut, vt, Lu_d, Lv_d, k3u, k3v, g, Du, Dv, A, B);
+    fitzhugh_nagumo_rhs<<<gs,bs>>>(ut, vt, Lu_d, Lv_d, k3u, k3v, g, Du, Dv, a, gamma, epsilon);
 
     // ===== k4 =====
     // ut = u + dt * k3
@@ -250,16 +256,15 @@ int main(int argc, char** argv){
     laplacian2d<<<gs,bs>>>(ut, Lu_d, g, inv_h2);
     laplacian2d<<<gs,bs>>>(vt, Lv_d, g, inv_h2);
 
-    brusselator_rhs<<<gs,bs>>>(ut, vt, Lu_d, Lv_d, k4u, k4v, g, Du, Dv, A, B);
+    fitzhugh_nagumo_rhs<<<gs,bs>>>(ut, vt, Lu_d, Lv_d, k4u, k4v, g, Du, Dv, a, gamma, epsilon);
 
     rk4_combine<<<gs,bs>>>(u_d, v_d, k1u, k2u, k3u, k4u, k1v, k2v, k3v, k4v, g, dt);
   }
 
   writer.Close();
   if (compression_cpt) {
-    //cudaFree(compressed_u);
-    //cudaFree(compressed_v);
-    free(compressed_u); free(compressed_v);
+    free(compressed_u); 
+    free(compressed_v);
   }
 
   cudaFree(k4v); cudaFree(k3v); cudaFree(k2v); cudaFree(k1v);
@@ -269,7 +274,8 @@ int main(int argc, char** argv){
 
   MPI_Finalize();
   
-  std::cout << "compression ratio CR(u) = " << static_cast<float>(total_u_bytes) / static_cast<float>(compressed_size_u) << ", CR(v) = " << static_cast<float>(total_u_bytes) / static_cast<float>(compressed_size_v) << "\n"; 
+  if (compression_cpt) {
+    std::cout << "compression ratio CR(u) = " << static_cast<float>(total_u_bytes) / static_cast<float>(compressed_size_u) << ", CR(v) = " << static_cast<float>(total_u_bytes) / static_cast<float>(compressed_size_v) << "\n";
+  }
   return 0;
 }
-

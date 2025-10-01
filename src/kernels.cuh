@@ -48,6 +48,27 @@ __global__ void brusselator_rhs(const T* __restrict__ u,
   fv[id] = Dv * Lv[id] + (B * ui - ui*ui*vi);
 }
 
+// FitzHugh-Nagumo reaction RHS at each point
+template <typename T>
+__global__ void fitzhugh_nagumo_rhs(const T* __restrict__ u,
+                                    const T* __restrict__ v,
+                                    const T* __restrict__ Lu,
+                                    const T* __restrict__ Lv,
+                                    T* __restrict__ fu,
+                                    T* __restrict__ fv,
+                                    Grid2D g, T Du, T Dv, T a, T gamma, T epsilon)
+{
+  int i = blockIdx.x * blockDim.x + threadIdx.x ;
+  int j = blockIdx.y * blockDim.y + threadIdx.y ;
+  if (i >= g.nx || j >= g.ny) return;
+  int id = idx2D(i, j, g);
+  T ui = u[id], vi = v[id];
+  // du/dt = Du ∇²u + u(1-u^2) - v 
+  // dv/dt = Dv ∇²v + ε(u - γv - a)
+  fu[id] = Du * Lu[id] + ui * (T(1) - ui * ui) - vi;
+  fv[id] = Dv * Lv[id] + epsilon * (ui - gamma * vi - a);
+}
+
 // Classic RK4 update in-place (stage combination)
 // u_{n+1} = u_n + dt/6 * (k1 + 2k2 + 2k3 + k4)
 // Same for v
